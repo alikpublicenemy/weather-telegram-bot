@@ -199,14 +199,28 @@ async def build_timetable_message() -> str:
     public_url = os.getenv("WEBUNTIS_PUBLIC_URL", "").strip()
     tz = ZoneInfo(TIMEZONE)
     today = datetime.now(tz).date()
-    weekday = RU_WEEKDAYS[today.weekday()]
-    date_label = f"{weekday}, {today:%d.%m.%Y}"
-    header = f"📚 *Расписание на сегодня — {date_label}*"
+    target_date_text = os.getenv("TARGET_DATE", "").strip()
+    if target_date_text:
+        try:
+            target_day = date.fromisoformat(target_date_text)
+        except ValueError as exc:
+            raise ValueError("TARGET_DATE must be in YYYY-MM-DD format, for example 2026-10-12.") from exc
+    else:
+        target_day = today
+
+    weekday = RU_WEEKDAYS[target_day.weekday()]
+    date_label = f"{weekday}, {target_day:%d.%m.%Y}"
+    if target_date_text:
+        header = f"🧪 *Тест расписания — {date_label}*"
+    elif target_day == today:
+        header = f"📚 *Расписание на сегодня — {date_label}*"
+    else:
+        header = f"📚 *Расписание — {date_label}*"
 
     # The user has no lessons on Saturdays or Sundays. Skip WebUntis entirely
     # on weekends, while the overall job still sends the weather message.
-    if today.weekday() >= 5:
-        return f"{header}\n🌴 Сегодня выходной — занятий по расписанию нет."
+    if target_day.weekday() >= 5:
+        return f"{header}\n🌴 На эту дату занятий по расписанию нет (выходной)."
 
     if not public_url:
         return (
@@ -222,7 +236,7 @@ async def build_timetable_message() -> str:
             params = {
                 "elementType": element_type,
                 "elementId": entity_id,
-                "date": today.isoformat(),
+                "date": target_day.isoformat(),
                 "formatId": 1,
             }
             endpoint = f"{base_url}/api/public/timetable/weekly/data"
@@ -256,7 +270,7 @@ async def build_timetable_message() -> str:
                 for period in periods:
                     if not isinstance(period, dict):
                         continue
-                    if _date_as_yyyymmdd(period.get("date")) != today.strftime("%Y%m%d"):
+                    if _date_as_yyyymmdd(period.get("date")) != target_day.strftime("%Y%m%d"):
                         continue
                     identity = (
                         period.get("id"), period.get("lessonId"), period.get("date"),
@@ -320,7 +334,15 @@ async def build_timetable_message() -> str:
 async def main() -> None:
     weather_message = await build_weather_message()
     timetable_message = await build_timetable_message()
-    message = f"{weather_message}\n\n{timetable_message}"
+    target_date_text = os.getenv("TARGET_DATE", "").strip()
+    if target_date_text:
+        test_note = (
+            f"🧪 *Проверочный запуск:* расписание запрашивается на {target_date_text}.\n"
+            "Погодная часть сообщения отражает текущий день.\n\n"
+        )
+    else:
+        test_note = ""
+    message = f"{test_note}{weather_message}\n\n{timetable_message}"
     if len(message) > 4000:
         message = message[:3970] + "…\n(Сообщение сокращено)"
 

@@ -6,6 +6,12 @@ on:
     - cron: "7 7 * * *"
       timezone: "Europe/Berlin"
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Дата расписания для теста (YYYY-MM-DD). Пусто = сегодня."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -29,4 +35,5 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           WEBUNTIS_PUBLIC_URL: ${{ secrets.WEBUNTIS_PUBLIC_URL }}
+          TARGET_DATE: ${{ inputs.target_date }}
         run: python send_weather_once.py

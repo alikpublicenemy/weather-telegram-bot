@@ -1,14 +1,10 @@
-"""Send daily weather and public WebUntis timetable, then exit (GitHub Actions)."""
+"""Send daily weather and the signed-in user's WebUntis timetable, then exit."""
 import asyncio
-import base64
 import logging
 import os
-import time as system_time
 from datetime import date, datetime
-from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
-import httpx
 from telegram import Bot
 from telegram.helpers import escape_markdown
 
@@ -23,180 +19,50 @@ RU_WEEKDAYS = (
     "пятница", "суббота", "воскресенье",
 )
 
-
-def _parse_public_link(public_url: str) -> tuple[str, str, int, int]:
-    """Return WebUntis base URL, school slug, public element type and ID.
-
-    New WebUntis share links keep timetable details in the URL fragment,
-    for example: /WebUntis?school=school-name#/basic/timetablePublic/my-student?date=...&entityId=123
-    """
-    parsed = urlsplit(public_url.strip())
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
-        raise ValueError("WEBUNTIS_PUBLIC_URL must be the full public link copied from WebUntis.")
-
-    school_values = parse_qs(parsed.query).get("school", [])
-    school = school_values[0].strip() if school_values else ""
-    fragment = parsed.fragment
-    fragment_query = fragment.split("?", 1)[1] if "?" in fragment else ""
-    fragment_params = parse_qs(fragment_query)
-    entity_id_values = fragment_params.get("entityId", [])
-    if not school or not entity_id_values:
-        raise ValueError("The WebUntis link has no school or entityId. Copy it with 'Öffentliche Link kopieren'.")
-
-    try:
-        entity_id = int(entity_id_values[0])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Could not read entityId from the WebUntis public link.") from exc
-
-    # The supplied route contains 'my-student', which is a student timetable.
-    route = fragment.split("?", 1)[0].rstrip("/")
-    if route.endswith("/my-student"):
-        element_type = 5
-    elif route.endswith("/my-class") or route.endswith("/class"):
-        element_type = 1
-    elif route.endswith("/my-teacher") or route.endswith("/teacher"):
-        element_type = 2
-    elif route.endswith("/room"):
-        element_type = 4
-    else:
-        # In the link supplied for this project the route is my-student.
-        # Defaulting to student is appropriate for a student timetable share link.
-        element_type = 5
-
-    base_url = f"{parsed.scheme}://{parsed.netloc}/WebUntis"
-    return base_url, school, element_type, entity_id
+# Values come from the WebUntis link the user supplied:
+# https://wirtschaftsschule.webuntis.com/WebUntis?school=wirtschaftsschule
+WEBUNTIS_SERVER = "wirtschaftsschule.webuntis.com"
+WEBUNTIS_SCHOOL = "wirtschaftsschule"
 
 
-def _extract_timetable_data(payload: dict):
-    """Return the timetable data object if the response resembles timetable JSON."""
-    try:
-        data = payload["data"]["result"]["data"]
-    except (KeyError, TypeError):
-        return None
-    if isinstance(data, dict) and isinstance(data.get("elementPeriods"), dict):
-        return data
-    return None
-
-
-async def _anonymous_login(client: httpx.AsyncClient, base_url: str, school: str) -> None:
-    """Create a WebUntis anonymous session used for public timetables.
-
-    The school timetable itself must be marked public by the school. No student
-    password is used or stored by this script.
-    """
-    shared_secret_url = f"{base_url}/jsonrpc_intern.do"
-    response = await client.post(
-        shared_secret_url,
-        params={"m": "getAppSharedSecret", "school": school, "v": "i3.5"},
-        json={
-            "id": "weather-bot-anon-init",
-            "method": "getAppSharedSecret",
-            "params": [{"userName": "#anonymous#", "password": ""}],
-            "jsonrpc": "2.0",
-        },
-    )
-    response.raise_for_status()
-    try:
-        init_payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("WebUntis did not return JSON during anonymous login initialization.") from exc
-    if init_payload.get("error"):
-        raise RuntimeError("WebUntis rejected anonymous public timetable access.")
-
-    login_response = await client.post(
-        f"{base_url}/jsonrpc_intern.do",
-        params={"m": "getUserData2017", "school": school, "v": "i2.2"},
-        json={
-            "id": "weather-bot-anon-login",
-            "method": "getUserData2017",
-            "params": [{
-                "auth": {
-                    "clientTime": int(system_time.time() * 1000),
-                    "user": "#anonymous#",
-                    "otp": 100170,
-                }
-            }],
-            "jsonrpc": "2.0",
-        },
-    )
-    login_response.raise_for_status()
-    try:
-        login_payload = login_response.json()
-    except ValueError as exc:
-        raise RuntimeError("WebUntis did not return JSON during anonymous login.") from exc
-    if login_payload.get("error") or not client.cookies.get("JSESSIONID"):
-        raise RuntimeError("WebUntis did not create an anonymous session for public timetable access.")
-
-    # Some WebUntis deployments require this companion cookie in addition to JSESSIONID.
-    encoded_school = "_" + base64.b64encode(school.encode("utf-8")).decode("ascii")
-    hostname = urlsplit(base_url).hostname
-    client.cookies.set("schoolname", encoded_school, domain=hostname, path="/WebUntis")
-
-
-async def _rpc_list(client: httpx.AsyncClient, base_url: str, school: str, method: str) -> list[dict]:
-    """Best-effort lookup for human-readable subject, teacher and room names."""
-    try:
-        response = await client.post(
-            f"{base_url}/jsonrpc.do",
-            params={"school": school},
-            json={"id": f"weather-bot-{method}", "method": method, "params": {}, "jsonrpc": "2.0"},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        result = payload.get("result")
-        return result if isinstance(result, list) else []
-    except Exception:
-        logger.info("Optional WebUntis lookup %s was unavailable; using timetable text fallbacks.", method)
-        return []
-
-
-def _make_lookup(items: list[dict]) -> dict[int, str]:
-    lookup = {}
-    for item in items:
+def _name_of(item, attributes: tuple[str, ...]) -> str:
+    """Get the first non-empty display-name attribute from a WebUntis object."""
+    for attr in attributes:
         try:
-            item_id = int(item.get("id"))
-        except (TypeError, ValueError, AttributeError):
-            continue
-        label = item.get("longName") or item.get("name") or item.get("displayname")
-        if label:
-            lookup[item_id] = " ".join(str(label).split())
-    return lookup
+            value = getattr(item, attr, None)
+        except Exception:
+            value = None
+        if value:
+            return " ".join(str(value).split())
+    return ""
 
 
 def _time_label(value) -> str:
-    try:
-        raw = f"{int(value):04d}"
-        return f"{raw[:2]}:{raw[2:]}"
-    except (TypeError, ValueError):
-        return "--:--"
-
-
-def _date_as_yyyymmdd(value) -> str:
     if value is None:
-        return ""
-    return str(value).replace("-", "").replace("/", "")[:8]
-
-
-def _period_labels(period: dict, subjects: dict[int, str], teachers: dict[int, str], rooms: dict[int, str]):
-    names = {"subjects": [], "teachers": [], "rooms": []}
-    for element in period.get("elements", []) or []:
+        return "--:--"
+    if hasattr(value, "strftime"):
         try:
-            element_type = int(element.get("type"))
-            element_id = int(element.get("id"))
-        except (AttributeError, TypeError, ValueError):
-            continue
-        if element_type == 3 and element_id in subjects:
-            names["subjects"].append(subjects[element_id])
-        elif element_type == 2 and element_id in teachers:
-            names["teachers"].append(teachers[element_id])
-        elif element_type == 4 and element_id in rooms:
-            names["rooms"].append(rooms[element_id])
-    return names
+            return value.strftime("%H:%M")
+        except Exception:
+            pass
+    text = str(value)
+    if len(text) >= 16 and text[10] in {"T", " "}:
+        return text[11:16]
+    return text[:5] if len(text) >= 5 else "--:--"
 
 
-async def build_timetable_message() -> str:
-    """Fetch today's periods through the public WebUntis timetable endpoint."""
-    public_url = os.getenv("WEBUNTIS_PUBLIC_URL", "").strip()
+def _period_items(period, attribute: str) -> list:
+    try:
+        value = getattr(period, attribute, None)
+        return list(value) if value else []
+    except Exception:
+        return []
+
+
+def build_timetable_message() -> str:
+    """Log in to WebUntis and fetch the timetable of the authenticated student."""
+    username = os.getenv("WEBUNTIS_USERNAME", "").strip()
+    password = os.getenv("WEBUNTIS_PASSWORD", "")
     tz = ZoneInfo(TIMEZONE)
     today = datetime.now(tz).date()
     target_date_text = os.getenv("TARGET_DATE", "").strip()
@@ -217,123 +83,106 @@ async def build_timetable_message() -> str:
     else:
         header = f"📚 *Расписание — {date_label}*"
 
-    # The user has no lessons on Saturdays or Sundays. Skip WebUntis entirely
-    # on weekends, while the overall job still sends the weather message.
+    # Saturdays and Sundays are always treated as days without lessons.
     if target_day.weekday() >= 5:
         return f"{header}\n🌴 На эту дату занятий по расписанию нет (выходной)."
 
-    if not public_url:
+    if not username or not password:
         return (
             f"{header}\n"
-            "⚠️ WebUntis пока не подключён. Добавь публичную ссылку в GitHub Secret "
-            "`WEBUNTIS_PUBLIC_URL`."
-        )
-
-    try:
-        base_url, school, element_type, entity_id = _parse_public_link(public_url)
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-            # Try the public endpoint directly first. Some schools expose it without a session.
-            params = {
-                "elementType": element_type,
-                "elementId": entity_id,
-                "date": target_day.isoformat(),
-                "formatId": 1,
-            }
-            endpoint = f"{base_url}/api/public/timetable/weekly/data"
-            response = await client.get(endpoint, params=params)
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
-            data = _extract_timetable_data(payload) if response.is_success else None
-
-            if data is None:
-                # Official WebUntis public-timetable links can be opened without a student login;
-                # its data endpoint may nevertheless need WebUntis's anonymous session.
-                await _anonymous_login(client, base_url, school)
-                response = await client.get(endpoint, params=params)
-                response.raise_for_status()
-                try:
-                    payload = response.json()
-                except ValueError as exc:
-                    raise RuntimeError("WebUntis returned a non-JSON response for the public timetable.") from exc
-                data = _extract_timetable_data(payload)
-                if data is None:
-                    raise RuntimeError("WebUntis did not return the expected public timetable data.")
-
-            elements_by_period = data.get("elementPeriods", {})
-            all_periods = []
-            seen = set()
-            for periods in elements_by_period.values():
-                if not isinstance(periods, list):
-                    continue
-                for period in periods:
-                    if not isinstance(period, dict):
-                        continue
-                    if _date_as_yyyymmdd(period.get("date")) != target_day.strftime("%Y%m%d"):
-                        continue
-                    identity = (
-                        period.get("id"), period.get("lessonId"), period.get("date"),
-                        period.get("startTime"), period.get("endTime"),
-                    )
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    all_periods.append(period)
-
-            # These names are optional; timetable access remains usable if lookups are restricted.
-            subjects_items, teachers_items, rooms_items = await asyncio.gather(
-                _rpc_list(client, base_url, school, "getSubjects"),
-                _rpc_list(client, base_url, school, "getTeachers"),
-                _rpc_list(client, base_url, school, "getRooms"),
-            )
-            subjects = _make_lookup(subjects_items)
-            teachers = _make_lookup(teachers_items)
-            rooms = _make_lookup(rooms_items)
-
-    except Exception as exc:
-        logger.warning("Could not fetch WebUntis public timetable (%s).", type(exc).__name__)
-        return (
-            f"{header}\n"
-            "⚠️ Не удалось получить расписание из публичной страницы WebUntis. Проверь секрет "
-            "`WEBUNTIS_PUBLIC_URL` и доступность расписания без входа в аккаунт. "
+            "⚠️ Не настроен вход в WebUntis. Добавь секреты `WEBUNTIS_USERNAME` и "
+            "`WEBUNTIS_PASSWORD` в GitHub → Settings → Secrets and variables → Actions. "
             "Погода будет отправлена независимо от этой ошибки."
         )
 
-    all_periods.sort(key=lambda p: (int(p.get("startTime") or 0), int(p.get("endTime") or 0)))
-    if not all_periods:
-        return f"{header}\n🎉 На сегодня занятий в публичном расписании нет."
+    try:
+        # Imported here so a timetable-library issue cannot prevent the weather
+        # portion from being sent. Never log the supplied credentials.
+        import webuntis
+
+        with webuntis.Session(
+            username=username,
+            password=password,
+            server=WEBUNTIS_SERVER,
+            school=WEBUNTIS_SCHOOL,
+            useragent="PersonalWeatherTelegramBot/1.0",
+        ).login() as session:
+            periods = list(session.my_timetable(start=target_day, end=target_day))
+
+    except Exception as exc:
+        error_name = type(exc).__name__
+        logger.warning("WebUntis timetable fetch failed (error type: %s).", error_name)
+        if error_name == "BadCredentialsError":
+            detail = (
+                "WebUntis не принял логин или пароль. Проверь секреты `WEBUNTIS_USERNAME` "
+                "и `WEBUNTIS_PASSWORD` — используй те же данные, что и при входе на сайт."
+            )
+        elif error_name in {"ImportError", "ModuleNotFoundError"}:
+            detail = "Не удалось загрузить библиотеку WebUntis. Проверь установку зависимостей в GitHub Actions."
+        else:
+            detail = (
+                "Не удалось войти в WebUntis API или получить личное расписание "
+                f"(ошибка {error_name}). Возможно, школа ограничивает API или изменён способ входа. "
+                "Проверь журнал запуска в GitHub Actions."
+            )
+        return f"{header}\n⚠️ {detail}\nПогода будет отправлена независимо от этой ошибки."
+
+    periods.sort(key=lambda period: _time_label(getattr(period, "start", None)))
+    if not periods:
+        return (
+            f"{header}\n"
+            "🎉 WebUntis не показывает уроков на эту дату. Возможно, это выходной, каникулы "
+            "или расписание ещё не опубликовано."
+        )
 
     lines = [header, ""]
-    for period in all_periods:
-        start = _time_label(period.get("startTime"))
-        end = _time_label(period.get("endTime"))
-        labels = _period_labels(period, subjects, teachers, rooms)
-        subject = ", ".join(dict.fromkeys(labels["subjects"]))
+    for period in periods:
+        start = _time_label(getattr(period, "start", None))
+        end = _time_label(getattr(period, "end", None))
+        subjects = [
+            _name_of(item, ("long_name", "name"))
+            for item in _period_items(period, "subjects")
+        ]
+        subjects = [item for item in subjects if item]
+        subject = ", ".join(dict.fromkeys(subjects))
         if not subject:
-            subject = str(period.get("lessonText") or period.get("periodText") or "Урок").strip()
+            subject = _name_of(period, ("lstext", "substText", "activityType")) or "Урок"
         subject = " ".join(subject.replace("\n", " ").split())
+        code = getattr(period, "code", None)
+        if code == "cancelled":
+            subject = "❌ Отменён: " + subject
+        elif code == "irregular":
+            subject = "🔁 Замена: " + subject
         line = f"• *{escape_markdown(subject[:120], version=1)}* — {start}–{end}"
 
-        if labels["rooms"]:
-            rooms_text = ", ".join(dict.fromkeys(labels["rooms"]))
-            line += f" · 🚪 {escape_markdown(rooms_text, version=1)}"
-        if labels["teachers"]:
-            teachers_text = ", ".join(dict.fromkeys(labels["teachers"]))
-            line += f" · {escape_markdown(teachers_text, version=1)}"
+        rooms = [
+            _name_of(item, ("name", "long_name"))
+            for item in _period_items(period, "rooms")
+        ]
+        rooms = [item for item in rooms if item]
+        if rooms:
+            line += " · 🚪 " + escape_markdown(", ".join(dict.fromkeys(rooms)), version=1)
+
+        teachers = [
+            _name_of(item, ("full_name", "name", "long_name"))
+            for item in _period_items(period, "teachers")
+        ]
+        teachers = [item for item in teachers if item]
+        if teachers:
+            line += " · 👨‍🏫 " + escape_markdown(", ".join(dict.fromkeys(teachers)), version=1)
         lines.append(line)
 
-        note = str(period.get("substText") or period.get("periodText") or "").strip()
+        note = _name_of(period, ("substText", "lstext"))
         if note and note.casefold() != subject.casefold() and len(note) <= 200:
-            lines.append(f"  _{escape_markdown(' '.join(note.split()), version=1)}_")
+            lines.append(f"  _{escape_markdown(note, version=1)}_")
 
-    lines.extend(["", "_Источник: публичное расписание WebUntis_"])
+    lines.extend(["", "_Источник: личное расписание WebUntis_"])
     return "\n".join(lines)
 
 
 async def main() -> None:
     weather_message = await build_weather_message()
-    timetable_message = await build_timetable_message()
+    timetable_message = await asyncio.to_thread(build_timetable_message)
     target_date_text = os.getenv("TARGET_DATE", "").strip()
     if target_date_text:
         test_note = (

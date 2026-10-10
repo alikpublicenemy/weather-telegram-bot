@@ -34,6 +34,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          WEBUNTIS_PUBLIC_URL: ${{ secrets.WEBUNTIS_PUBLIC_URL }}
+          WEBUNTIS_USERNAME: ${{ secrets.WEBUNTIS_USERNAME }}
+          WEBUNTIS_PASSWORD: ${{ secrets.WEBUNTIS_PASSWORD }}
           TARGET_DATE: ${{ inputs.target_date }}
         run: python send_weather_once.py

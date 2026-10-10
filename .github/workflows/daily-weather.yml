@@ -1,0 +1,32 @@
+name: Daily weather
+
+on:
+  schedule:
+    # Scheduled at 07:07 Europe/Berlin daily; a few minutes past the hour
+    # reduces the chance of GitHub's scheduled-run queue being busy.
+    - cron: "7 7 * * *"
+      timezone: "Europe/Berlin"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-weather:
+    name: Send the daily weather message
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out private project
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Send weather to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: python send_weather_once.py

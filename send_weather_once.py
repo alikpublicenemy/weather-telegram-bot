@@ -109,6 +109,25 @@ def build_timetable_message() -> str:
         ).login() as session:
             periods = list(session.my_timetable(start=target_day, end=target_day))
 
+            # WebUntis period relationships (subjects, rooms, teachers) are lazy:
+            # the properties may call the API the first time they are accessed.
+            # Resolve them before leaving the session, otherwise later lookups
+            # happen after logout and can silently fall back to generic "Unterricht".
+            for period in periods:
+                for attribute in ("subjects", "rooms", "teachers"):
+                    try:
+                        related = getattr(period, attribute, None)
+                        if related:
+                            list(related)
+                    except Exception as lazy_error:
+                        # Keep the weather delivery resilient; rendering below
+                        # will use available text fields if a relation is absent.
+                        logger.debug(
+                            "Could not preload WebUntis %s (error type: %s).",
+                            attribute,
+                            type(lazy_error).__name__,
+                        )
+
     except Exception as exc:
         error_name = type(exc).__name__
         logger.warning("WebUntis timetable fetch failed (error type: %s).", error_name)

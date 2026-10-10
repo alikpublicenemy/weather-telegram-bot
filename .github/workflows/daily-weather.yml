@@ -1,4 +1,4 @@
-name: Daily weather
+name: Daily weather and WebUntis timetable
 
 on:
   schedule:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   send-weather:
-    name: Send the daily weather message
+    name: Send daily weather and timetable
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -29,4 +29,5 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          WEBUNTIS_ICAL_URL: ${{ secrets.WEBUNTIS_ICAL_URL }}
         run: python send_weather_once.py

@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]>=22.8,<23
 httpx>=0.27,<1
 python-dotenv>=1.0,<2
 tzdata>=2024.1
+icalendar>=6.1,<7

@@ -203,6 +203,11 @@ async def build_timetable_message() -> str:
     date_label = f"{weekday}, {today:%d.%m.%Y}"
     header = f"📚 *Расписание на сегодня — {date_label}*"
 
+    # The user has no lessons on Saturdays or Sundays. Skip WebUntis entirely
+    # on weekends, while the overall job still sends the weather message.
+    if today.weekday() >= 5:
+        return f"{header}\n🌴 Сегодня выходной — занятий по расписанию нет."
+
     if not public_url:
         return (
             f"{header}\n"

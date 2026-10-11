@@ -24,16 +24,17 @@ Cloud Run Job завершает работу после отправки утр
 
 1. После слияния PR дождись успешной сборки Cloud Build. Используемый образ:
    `europe-west3-docker.pkg.dev/telegram-weather-bot-511313/telegram-bot/weather-telegram-bot:latest`
-2. Создай Secret Manager secret `telegram-webhook-secret` с длинным случайным значением. Не используй Telegram bot token как webhook secret.
-3. Дай сервисному аккаунту `telegram-bot-runtime@telegram-weather-bot-511313.iam.gserviceaccount.com` роль Secret Manager Secret Accessor только для секретов `telegram-bot-token` и `telegram-webhook-secret`.
-4. Создай Cloud Run Service `telegram-commute-webhook` в `europe-west3` с тем же образом. Команда контейнера: `gunicorn`. Аргументы: `--bind 0.0.0.0:8080 commute_service:app`.
-5. Настрой переменные и секреты сервиса:
+2. Обнови Cloud Run Job `telegram-weather-daily`, чтобы он использовал собранный образ: открой Job → Edit → замени image на URI выше → Deploy. Сохрани прежние переменные окружения, секреты и service account. Иначе старый Job может продолжать отправлять сообщение без кнопки.
+3. Создай Secret Manager secret `telegram-webhook-secret` со случайным значением из букв, цифр, `_` и `-` (например, 64 символа hex). Не используй Telegram bot token как webhook secret.
+4. Создай Cloud Run Service `telegram-commute-webhook` в `europe-west3` с тем же образом. В настройках Service account выбери `telegram-bot-runtime@telegram-weather-bot-511313.iam.gserviceaccount.com`. Команда контейнера: `gunicorn`. Аргументы: `--bind 0.0.0.0:8080 commute_service:app`.
+5. Дай выбранному service account роль Secret Manager Secret Accessor только для секретов `telegram-bot-token` и `telegram-webhook-secret`.
+6. Настрой переменные и секреты сервиса:
    - `BOT_TOKEN` — Secret Manager `telegram-bot-token`, version `1`.
    - `TELEGRAM_USER_ID` — тот же числовой Telegram ID, что в Cloud Run Job.
    - `WEBHOOK_SECRET` — Secret Manager `telegram-webhook-secret`, version `1`.
    - `TIMEZONE=Europe/Berlin`.
-6. Разреши неаутентифицированные HTTP-вызовы к Cloud Run Service, чтобы Telegram мог вызвать webhook. Сам запрос проверяется по заголовку `X-Telegram-Bot-Api-Secret-Token`.
-7. После создания сервиса скопируй его URL. Выполни следующий блок в Cloud Shell, подставив URL сервиса. Секреты не публикуй и не отправляй в чат:
+7. Разреши неаутентифицированные HTTP-вызовы к Cloud Run Service, чтобы Telegram мог вызвать webhook. Сам запрос проверяется по заголовку `X-Telegram-Bot-Api-Secret-Token`.
+8. После создания сервиса скопируй его URL. Выполни следующий блок в Cloud Shell, подставив URL сервиса. Секреты не публикуй и не отправляй в чат:
 
 ```bash
 PROJECT_ID="telegram-weather-bot-511313"

@@ -1,9 +1,13 @@
 """Calculate a school commute using VAG's official PULS realtime API."""
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import math
+import threading
 import unicodedata
+import zipfile
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -25,6 +29,150 @@ REQUIRED_DIRECTION = "röthenbach"
 
 class VAGApiError(RuntimeError):
     """The VAG API could not supply enough data for a safe calculation."""
+
+
+GTFS_URL = "https://www.vgn.de/opendata/GTFS.zip"
+_GTFS_LOCK = threading.Lock()
+_GTFS_CACHE: dict | None = None
+
+
+def _load_gtfs() -> dict:
+    """Load and cache the official VGN static GTFS timetable in memory."""
+    global _GTFS_CACHE
+    if _GTFS_CACHE is not None:
+        return _GTFS_CACHE
+    with _GTFS_LOCK:
+        if _GTFS_CACHE is not None:
+            return _GTFS_CACHE
+        with httpx.Client(timeout=45.0, follow_redirects=True) as client:
+            response = client.get(GTFS_URL)
+            response.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            names = set(archive.namelist())
+
+            def rows(filename: str) -> list[dict[str, str]]:
+                if filename not in names:
+                    return []
+                with archive.open(filename) as raw:
+                    return list(csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig")))
+
+            stops = rows("stops.txt")
+            routes = rows("routes.txt")
+            all_trips = rows("trips.txt")
+            calendar = rows("calendar.txt")
+            calendar_dates = rows("calendar_dates.txt")
+            route_by_id = {row["route_id"]: row for row in routes}
+            u2_route_ids = {
+                row["route_id"] for row in routes
+                if _norm(row.get("route_short_name", "")).replace(" ", "") == "u2"
+                and (not row.get("route_type") or row.get("route_type") == "1")
+            }
+            trip_by_id = {
+                row["trip_id"]: row for row in all_trips
+                if row.get("route_id") in u2_route_ids
+            }
+            # stop_times.txt is the largest GTFS file. Keep only U2 rows so the
+            # Cloud Run service stays within its 512 MiB memory limit.
+            times_by_trip: dict[str, list[dict[str, str]]] = {}
+            if "stop_times.txt" in names:
+                with archive.open("stop_times.txt") as raw:
+                    for row in csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig")):
+                        trip_id = row.get("trip_id", "")
+                        if trip_id in trip_by_id:
+                            times_by_trip.setdefault(trip_id, []).append(row)
+
+        origin_ids = {
+            row["stop_id"] for row in stops
+            if _norm(ORIGIN_NAME) in _norm(row.get("stop_name", ""))
+        }
+        destination_ids = {
+            row["stop_id"] for row in stops
+            if _norm(DESTINATION_NAME) in _norm(row.get("stop_name", ""))
+        }
+        for calls in times_by_trip.values():
+            calls.sort(key=lambda row: int(row.get("stop_sequence", "0") or 0))
+
+        _GTFS_CACHE = {
+            "origin_ids": origin_ids,
+            "destination_ids": destination_ids,
+            "route_by_id": route_by_id,
+            "trip_by_id": trip_by_id,
+            "times_by_trip": times_by_trip,
+            "calendar": {row["service_id"]: row for row in calendar},
+            "calendar_dates": calendar_dates,
+        }
+        logger.info(
+            "Loaded official VGN GTFS: origin_stops=%d destination_stops=%d trips=%d",
+            len(origin_ids), len(destination_ids), len(trips)
+        )
+        return _GTFS_CACHE
+
+
+def _gtfs_service_runs(data: dict, service_id: str, service_date) -> bool:
+    date_key = service_date.strftime("%Y%m%d")
+    exceptions = [
+        row for row in data["calendar_dates"]
+        if row.get("service_id") == service_id and row.get("date") == date_key
+    ]
+    if exceptions:
+        return exceptions[-1].get("exception_type") == "1"
+    rule = data["calendar"].get(service_id)
+    if not rule:
+        return False
+    if not (rule.get("start_date", "00000000") <= date_key <= rule.get("end_date", "99999999")):
+        return False
+    return rule.get(service_date.strftime("%A").lower(), "0") == "1"
+
+
+def _gtfs_clock(value: str, service_date) -> datetime | None:
+    try:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+        base = datetime.combine(service_date, time(0, 0), tzinfo=TIMEZONE)
+        return base + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    except (ValueError, TypeError):
+        return None
+
+
+def _gtfs_scheduled_trip(now: datetime, deadline: datetime) -> tuple[datetime, datetime] | None:
+    """Find latest scheduled U2 trip to Rathenauplatz for the target service date."""
+    data = _load_gtfs()
+    service_date = deadline.date()
+    matches: list[tuple[datetime, datetime]] = []
+    for trip_id, trip in data["trip_by_id"].items():
+        route = data["route_by_id"].get(trip.get("route_id", ""), {})
+        if _norm(route.get("route_short_name", "")).replace(" ", "") != "u2":
+            continue
+        if route.get("route_type") and route.get("route_type") != "1":
+            continue
+        if not _gtfs_service_runs(data, trip.get("service_id", ""), service_date):
+            continue
+        calls = data["times_by_trip"].get(trip_id, [])
+        origin_call = next((row for row in calls if row.get("stop_id") in data["origin_ids"]), None)
+        if not origin_call:
+            continue
+        origin_sequence = int(origin_call.get("stop_sequence", "0") or 0)
+        destination_call = next(
+            (row for row in calls
+             if row.get("stop_id") in data["destination_ids"]
+             and int(row.get("stop_sequence", "0") or 0) > origin_sequence),
+            None,
+        )
+        if not destination_call:
+            continue
+        headsign = _norm(trip.get("trip_headsign", ""))
+        # Herrnhütte to Rathenauplatz requires U2 in the direction of Röthenbach.
+        if headsign and "rothenbach" not in headsign:
+            continue
+        departure = _gtfs_clock(origin_call.get("departure_time", ""), service_date)
+        arrival = _gtfs_clock(destination_call.get("arrival_time", ""), service_date)
+        if not departure or not arrival:
+            continue
+        if departure < now + timedelta(minutes=WALK_TO_STATION_MINUTES + DEPARTURE_BUFFER_MINUTES):
+            continue
+        if arrival + timedelta(minutes=WALK_TO_SCHOOL_MINUTES) > deadline:
+            continue
+        matches.append((departure, arrival))
+    return max(matches, key=lambda pair: pair[0]) if matches else None
 
 
 def _norm(value: object) -> str:
@@ -269,11 +417,37 @@ def build_commute_message(now: datetime | None = None) -> str:
                         + f"\n\n_Отправление по данным: {departure_source}. Время поездки взято из данных конкретного рейса VAG._"
                     )
     except (httpx.HTTPError, ValueError, VAGApiError) as exc:
-        logger.exception("Could not calculate VAG route (%s)", type(exc).__name__)
-        return (
-            "⚠️ Сейчас не удалось получить маршрут из системы VAG.\n\n"
-            "Попробуй нажать кнопку ещё раз через минуту или проверь отправления в официальном VAGstart: https://start.vag.de/"
-        )
+        logger.warning("Could not calculate realtime VAG route (%s); trying static GTFS", type(exc).__name__)
+
+    # VAG PULS is primarily a live departure monitor and may not expose next-day
+    # departures. Fall back to VGN's official static GTFS timetable.
+    try:
+        scheduled = _gtfs_scheduled_trip(now, deadline)
+        if scheduled:
+            departure_dt, arrival_dt = scheduled
+            leave_time = departure_dt - timedelta(
+                minutes=WALK_TO_STATION_MINUTES + DEPARTURE_BUFFER_MINUTES
+            )
+            minutes_until_leave = max(0, math.ceil((leave_time - now).total_seconds() / 60))
+            time_until_departure = max(0, math.ceil((departure_dt - now).total_seconds() / 60))
+            school_arrival = arrival_dt + timedelta(minutes=WALK_TO_SCHOOL_MINUTES)
+            deadline_margin = max(0, math.floor((deadline - school_arrival).total_seconds() / 60))
+            logger.info("Using VGN GTFS scheduled trip: departure=%s arrival=%s", departure_dt.isoformat(), arrival_dt.isoformat())
+            return (
+                "🚇 Расчёт поездки до школы\n"
+                f"Цель: {target_label}, быть в школе к {deadline:%H:%M}\n\n"
+                f"🚪 Выйти из дома: *{leave_time:%H:%M}*"
+                + (f" (через ~{minutes_until_leave} мин.)" if minutes_until_leave else " (пора выходить)")
+                + f"\n🚉 Herrnhütte: U2 → Röthenbach, отправление *{departure_dt:%H:%M}*"
+                + f"\n⏳ До отправления от текущего момента: ~{time_until_departure} мин."
+                + f"\n📍 Rathenauplatz: прибытие *{arrival_dt:%H:%M}*"
+                + f"\n🚶 До школы: {WALK_TO_SCHOOL_MINUTES} мин."
+                + f"\n🎓 У школы: *{school_arrival:%H:%M}*"
+                + f"\n✅ Запас до {deadline:%H:%M}: {deadline_margin} мин."
+                + "\n\n_Источник: плановое расписание VGN (GTFS). Реальные задержки могут изменить время._"
+            )
+    except (httpx.HTTPError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+        logger.exception("VGN GTFS fallback failed (%s)", type(exc).__name__)
 
     logger.warning(
         "VAG route had no match: stops=%d departures=%d u2=%d in_window=%d trips_checked=%d target=%s",

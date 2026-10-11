@@ -5,7 +5,7 @@ import os
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.helpers import escape_markdown
 
 from bot import BOT_TOKEN, CITY, TELEGRAM_USER_ID, TIMEZONE, build_weather_message
@@ -215,10 +215,14 @@ async def main() -> None:
         message = message[:3970] + "…\n(Сообщение сокращено)"
 
     async with Bot(token=BOT_TOKEN) as telegram_bot:
+        commute_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚇 Когда выходить?", callback_data="commute_v1")]
+        ])
         await telegram_bot.send_message(
             chat_id=TELEGRAM_USER_ID,
             text=message,
             parse_mode="Markdown",
+            reply_markup=commute_keyboard,
         )
     logger.info("Daily weather and timetable message sent successfully.")
 

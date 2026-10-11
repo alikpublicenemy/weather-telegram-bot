@@ -417,11 +417,7 @@ def build_commute_message(now: datetime | None = None) -> str:
                         + f"\n\n_Отправление по данным: {departure_source}. Время поездки взято из данных конкретного рейса VAG._"
                     )
     except (httpx.HTTPError, ValueError, VAGApiError) as exc:
-        logger.exception("Could not calculate VAG route (%s)", type(exc).__name__)
-        return (
-            "⚠️ Сейчас не удалось получить маршрут из системы VAG.\n\n"
-            "Попробуй нажать кнопку ещё раз через минуту или проверь отправления в официальном VAGstart: https://start.vag.de/"
-        )
+        logger.warning("Could not calculate realtime VAG route (%s); trying static GTFS", type(exc).__name__)
 
     # VAG PULS is primarily a live departure monitor and may not expose next-day
     # departures. Fall back to VGN's official static GTFS timetable.
@@ -438,17 +434,17 @@ def build_commute_message(now: datetime | None = None) -> str:
             deadline_margin = max(0, math.floor((deadline - school_arrival).total_seconds() / 60))
             logger.info("Using VGN GTFS scheduled trip: departure=%s arrival=%s", departure_dt.isoformat(), arrival_dt.isoformat())
             return (
-                "🚇 Расчёт поездки до школы\\n"
-                f"Цель: {target_label}, быть в школе к {deadline:%H:%M}\\n\\n"
+                "🚇 Расчёт поездки до школы\n"
+                f"Цель: {target_label}, быть в школе к {deadline:%H:%M}\n\n"
                 f"🚪 Выйти из дома: *{leave_time:%H:%M}*"
                 + (f" (через ~{minutes_until_leave} мин.)" if minutes_until_leave else " (пора выходить)")
-                + f"\\n🚉 Herrnhütte: U2 → Röthenbach, отправление *{departure_dt:%H:%M}*"
-                + f"\\n⏳ До отправления от текущего момента: ~{time_until_departure} мин."
-                + f"\\n📍 Rathenauplatz: прибытие *{arrival_dt:%H:%M}*"
-                + f"\\n🚶 До школы: {WALK_TO_SCHOOL_MINUTES} мин."
-                + f"\\n🎓 У школы: *{school_arrival:%H:%M}*"
-                + f"\\n✅ Запас до {deadline:%H:%M}: {deadline_margin} мин."
-                + "\\n\\n_Источник: плановое расписание VGN (GTFS). Реальные задержки могут изменить время._"
+                + f"\n🚉 Herrnhütte: U2 → Röthenbach, отправление *{departure_dt:%H:%M}*"
+                + f"\n⏳ До отправления от текущего момента: ~{time_until_departure} мин."
+                + f"\n📍 Rathenauplatz: прибытие *{arrival_dt:%H:%M}*"
+                + f"\n🚶 До школы: {WALK_TO_SCHOOL_MINUTES} мин."
+                + f"\n🎓 У школы: *{school_arrival:%H:%M}*"
+                + f"\n✅ Запас до {deadline:%H:%M}: {deadline_margin} мин."
+                + "\n\n_Источник: плановое расписание VGN (GTFS). Реальные задержки могут изменить время._"
             )
     except (httpx.HTTPError, ValueError, KeyError, zipfile.BadZipFile) as exc:
         logger.exception("VGN GTFS fallback failed (%s)", type(exc).__name__)

@@ -1,0 +1,14 @@
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'europe-west3-docker.pkg.dev/telegram-weather-bot-511313/telegram-bot/weather-telegram-bot:latest'
+      - '.'
+
+images:
+  - 'europe-west3-docker.pkg.dev/telegram-weather-bot-511313/telegram-bot/weather-telegram-bot:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

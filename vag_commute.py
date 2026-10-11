@@ -139,6 +139,17 @@ def build_commute_message(now: datetime | None = None) -> str:
         minutes=WALK_TO_STATION_MINUTES + DEPARTURE_BUFFER_MINUTES
     )
     latest_arrival_at_station = deadline - timedelta(minutes=WALK_TO_SCHOOL_MINUTES)
+    # PULS supports TimeDelay so a test press in the evening can query the next
+    # school morning instead of incorrectly searching only the next 180 minutes.
+    query_start = earliest_departure_to_catch
+    delay_minutes = max(0, math.floor((query_start - now).total_seconds() / 60))
+    query_span = max(
+        1,
+        math.ceil((latest_arrival_at_station - query_start).total_seconds() / 60),
+    )
+
+    if query_start >= latest_arrival_at_station:
+        return "⚠️ Нет времени на безопасную поездку до указанного времени прибытия."
 
     try:
         with httpx.Client(timeout=8.0, follow_redirects=True) as client:
@@ -149,7 +160,12 @@ def build_commute_message(now: datetime | None = None) -> str:
                     payload = _get_json(
                         client,
                         f"abfahrten.json/{network}/{stop_id}",
-                        {"produkt": "ubahn", "timespan": 180, "limitcount": 60},
+                        {
+                            "produkt": "ubahn",
+                            "timedelay": delay_minutes,
+                            "timespan": query_span,
+                            "limitcount": 60,
+                        },
                     )
                 except (httpx.HTTPError, ValueError, VAGApiError) as exc:
                     logger.warning("VAG departures failed at %s (%s)", stop_id, type(exc).__name__)

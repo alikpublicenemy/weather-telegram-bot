@@ -186,8 +186,11 @@ def build_commute_message(now: datetime | None = None) -> str:
                         continue
                     if _norm(REQUIRED_DIRECTION) not in direction and "rothenbach" not in direction:
                         continue
+                    has_prediction = departure.get("Prognose") is True
                     departure_dt = _parse_datetime(
-                        departure.get("AbfahrtszeitIst") or departure.get("AbfahrtszeitSoll")
+                        (departure.get("AbfahrtszeitIst") if has_prediction else departure.get("AbfahrtszeitSoll"))
+                        or departure.get("AbfahrtszeitSoll")
+                        or departure.get("AbfahrtszeitIst")
                     )
                     if not departure_dt or not (
                         earliest_departure_to_catch <= departure_dt < latest_arrival_at_station
@@ -241,7 +244,7 @@ def build_commute_message(now: datetime | None = None) -> str:
                     deadline_margin = max(
                         0, math.floor((deadline - school_arrival).total_seconds() / 60)
                     )
-                    real_time_available = bool(departure.get("AbfahrtszeitIst"))
+                    real_time_available = departure.get("Prognose") is True
                     departure_source = "прогноз VAG" if real_time_available else "расписание VAG"
                     when = deadline.strftime("%H:%M")
                     return (

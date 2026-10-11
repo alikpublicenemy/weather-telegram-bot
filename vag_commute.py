@@ -155,9 +155,17 @@ def build_commute_message(now: datetime | None = None) -> str:
     if query_start >= latest_arrival_at_station:
         return "⚠️ Нет времени на безопасную поездку до указанного времени прибытия."
 
+    # Keep coarse counters so a no-match response can be diagnosed from Cloud Run logs.
+    stop_count = 0
+    departure_count = 0
+    u2_count = 0
+    in_window_count = 0
+    trip_checked_count = 0
+
     try:
         with httpx.Client(timeout=8.0, follow_redirects=True) as client:
             origin_stops = _stops(client, ORIGIN_NAME)
+            stop_count = len(origin_stops)
             candidates: list[tuple[datetime, dict]] = []
             for network, stop_id in origin_stops:
                 try:
@@ -174,18 +182,16 @@ def build_commute_message(now: datetime | None = None) -> str:
                 except (httpx.HTTPError, ValueError, VAGApiError) as exc:
                     logger.warning("VAG departures failed at %s (%s)", stop_id, type(exc).__name__)
                     continue
-                for departure in payload.get("Abfahrten", []) or []:
+                departures = payload.get("Abfahrten", []) or []
+                departure_count += len(departures)
+                for departure in departures:
                     line = _norm(departure.get("Linienname", departure.get("Linie", ""))).replace(" ", "")
                     product = _norm(departure.get("Produkt", "ubahn"))
-                    direction = _norm(
-                        f"{departure.get('Richtung', '')} {departure.get('Richtungstext', '')}"
-                    )
                     if line not in {REQUIRED_LINE, "2"}:
                         continue
                     if product and not any(x in product for x in ("ubahn", "u-bahn", "subway")):
                         continue
-                    if _norm(REQUIRED_DIRECTION) not in direction and "rothenbach" not in direction:
-                        continue
+                    u2_count += 1
                     has_prediction = departure.get("Prognose") is True
                     departure_dt = _parse_datetime(
                         (departure.get("AbfahrtszeitIst") if has_prediction else departure.get("AbfahrtszeitSoll"))
@@ -196,6 +202,7 @@ def build_commute_message(now: datetime | None = None) -> str:
                         earliest_departure_to_catch <= departure_dt < latest_arrival_at_station
                     ):
                         continue
+                    in_window_count += 1
                     if not (
                         departure.get("Fahrtnummer")
                         or departure.get("FahrtNummer")
@@ -219,6 +226,7 @@ def build_commute_message(now: datetime | None = None) -> str:
                 if trip_key in examined:
                     continue
                 examined.add(trip_key)
+                trip_checked_count += 1
                 try:
                     arrival_dt = _arrival_in_trip(
                         client,
@@ -267,8 +275,15 @@ def build_commute_message(now: datetime | None = None) -> str:
             "Попробуй нажать кнопку ещё раз через минуту или проверь отправления в официальном VAGstart: https://start.vag.de/"
         )
 
+    logger.warning(
+        "VAG route had no match: stops=%d departures=%d u2=%d in_window=%d trips_checked=%d target=%s",
+        stop_count, departure_count, u2_count, in_window_count, trip_checked_count, deadline.isoformat()
+    )
     return (
         f"⚠️ Не нашёл подходящую поездку U2, чтобы прибыть к {deadline:%H:%M} "
         f"({target_label}).\n\n"
-        "Проверь актуальные отправления Herrnhütte в VAGstart: https://start.vag.de/"
+        "Если ты проверяешь маршрут вечером, VAG может не отдавать прогноз отправления на следующее утро. "
+        "Попробуй утром повторно. Если сообщение повторится, пришли мне количество "
+        "остановок/рейсов из логов Cloud Run — проверим ответ API.\n\n"
+        "Проверь актуальные отправления в VAGstart: https://start.vag.de/"
     )

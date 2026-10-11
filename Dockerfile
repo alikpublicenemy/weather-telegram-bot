@@ -10,6 +10,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py send_weather_once.py ./
+COPY bot.py send_weather_once.py vag_commute.py commute_service.py ./
 
 CMD ["python", "send_weather_once.py"]

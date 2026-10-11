@@ -139,9 +139,13 @@ def build_commute_message(now: datetime | None = None) -> str:
         minutes=WALK_TO_STATION_MINUTES + DEPARTURE_BUFFER_MINUTES
     )
     latest_arrival_at_station = deadline - timedelta(minutes=WALK_TO_SCHOOL_MINUTES)
-    # PULS supports TimeDelay so a test press in the evening can query the next
-    # school morning instead of incorrectly searching only the next 180 minutes.
-    query_start = earliest_departure_to_catch
+    # Focus the query on the final hour before the arrival deadline. PULS supports
+    # TimeDelay, so an evening test press can query tomorrow morning rather than
+    # returning dozens of unrelated departures from tonight.
+    query_start = max(
+        earliest_departure_to_catch,
+        latest_arrival_at_station - timedelta(minutes=60),
+    )
     delay_minutes = max(0, math.floor((query_start - now).total_seconds() / 60))
     query_span = max(
         1,

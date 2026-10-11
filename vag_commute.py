@@ -58,12 +58,29 @@ def _load_gtfs() -> dict:
 
             stops = rows("stops.txt")
             routes = rows("routes.txt")
-            trips = rows("trips.txt")
-            stop_times = rows("stop_times.txt")
+            all_trips = rows("trips.txt")
             calendar = rows("calendar.txt")
             calendar_dates = rows("calendar_dates.txt")
+            route_by_id = {row["route_id"]: row for row in routes}
+            u2_route_ids = {
+                row["route_id"] for row in routes
+                if _norm(row.get("route_short_name", "")).replace(" ", "") == "u2"
+                and (not row.get("route_type") or row.get("route_type") == "1")
+            }
+            trip_by_id = {
+                row["trip_id"]: row for row in all_trips
+                if row.get("route_id") in u2_route_ids
+            }
+            # stop_times.txt is the largest GTFS file. Keep only U2 rows so the
+            # Cloud Run service stays within its 512 MiB memory limit.
+            times_by_trip: dict[str, list[dict[str, str]]] = {}
+            if "stop_times.txt" in names:
+                with archive.open("stop_times.txt") as raw:
+                    for row in csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig")):
+                        trip_id = row.get("trip_id", "")
+                        if trip_id in trip_by_id:
+                            times_by_trip.setdefault(trip_id, []).append(row)
 
-        stop_names = {row["stop_id"]: _norm(row.get("stop_name", "")) for row in stops}
         origin_ids = {
             row["stop_id"] for row in stops
             if _norm(ORIGIN_NAME) in _norm(row.get("stop_name", ""))
@@ -72,11 +89,6 @@ def _load_gtfs() -> dict:
             row["stop_id"] for row in stops
             if _norm(DESTINATION_NAME) in _norm(row.get("stop_name", ""))
         }
-        route_by_id = {row["route_id"]: row for row in routes}
-        trip_by_id = {row["trip_id"]: row for row in trips}
-        times_by_trip: dict[str, list[dict[str, str]]] = {}
-        for row in stop_times:
-            times_by_trip.setdefault(row["trip_id"], []).append(row)
         for calls in times_by_trip.values():
             calls.sort(key=lambda row: int(row.get("stop_sequence", "0") or 0))
 
